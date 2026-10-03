@@ -1,0 +1,23 @@
+services:
+  nc-link-watcher:
+    image: ghcr.io/zach-sb/nc-link-watcher:latest
+    container_name: nc-link-watcher
+    restart: unless-stopped
+    # user: "1000:1000"
+    # group_add: ["969"]
+    environment:
+      # DOCKER_HOST: tcp://socket-proxy:2375
+      # DOCKER_HOSTS: "unix:///var/run/docker.sock,nas=tcp://nas-proxy:2375"
+
+      NEXTCLOUD_URL: https://cloud.example.com
+      NEXTCLOUD_USER: admin
+      NEXTCLOUD_APP_PASSWORD: changeme
+
+      # DEFAULT_GROUPS: "admins"
+      # REMOVE_GRACE: "30"
+      # SYNC_INTERVAL: "300"
+      # HEALTH_PORT: "8080"
+    volumes:
+      - ./data:/data
+      - ./icons:/icons:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
