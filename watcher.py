@@ -29,7 +29,7 @@ import requests
 
 log = logging.getLogger("watcher")
 
-VERSION = "1.0.0"
+VERSION = os.environ.get("VERSION", "dev")   # the release tag, set at image build
 USER_AGENT = f"nc-link-watcher/{VERSION}"
 
 NO_ICON = ""                        # External Sites decides what to show

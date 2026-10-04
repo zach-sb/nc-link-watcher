@@ -21,10 +21,10 @@ Keeps the links in Nextcloud's External Sites app in step with Docker container 
 3. `docker compose up -d`, then `docker logs -f nc-link-watcher`.
 
 The compose file uses `ghcr.io/zach-sb/nc-link-watcher:latest`. Released images are published for
-amd64 and arm64, tagged `1.0.0`, `1.0`, `1` and `latest`. To build it yourself:
+amd64 and arm64, tagged with the release version (e.g. `1.2.3`), `1.2`, `1` and `latest`. To build it yourself:
 
 ```sh
-docker buildx build -t nc-link-watcher:1.0.0 --load .
+docker buildx build -t nc-link-watcher --load .
 ```
 
 ## Labels
@@ -234,8 +234,8 @@ pip install -r requirements.txt
 python -m unittest
 ```
 
-CI runs the tests and builds the image on every push. Pushing a tag `v<VERSION>` (it must match
-`VERSION` in `watcher.py`) also publishes the image to GHCR.
+CI runs the tests on every push to `main` and every pull request. Publishing a GitHub release with a
+tag like `v1.2.3` also builds the image and publishes it to GHCR as that version.
 
 ## License
 
