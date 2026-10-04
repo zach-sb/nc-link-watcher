@@ -1,9 +1,13 @@
 """Tests for the sync logic using in-memory fakes for Docker and Nextcloud."""
 
+import json
 import os
+import socket
+import socketserver
 import tempfile
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from unittest import mock
 
@@ -20,9 +24,8 @@ class FakeContainer:
 class FakeDocker:
     def __init__(self):
         self.running, self.fail = [], False
-        self.containers = self
 
-    def list(self):
+    def containers(self):
         if self.fail:
             raise RuntimeError("socket unreachable")
         return list(self.running)
@@ -500,8 +503,13 @@ class SyncTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "Docker: DOCKER_HOST not set and .* not mounted"):
             watcher.check_docker_access({"": None}, missing)
         watcher.check_docker_access({"": "tcp://socket-proxy:2375"}, missing)
-        missing.touch()
-        watcher.check_docker_access({"": None}, missing)
+        missing.mkdir()   # what a bind mount of a missing host path leaves behind
+        with self.assertRaisesRegex(SystemExit, "not mounted"):
+            watcher.check_docker_access({"": None}, missing)
+        sock = Path(self.tmp.name, "real.sock")
+        with socket.socket(socket.AF_UNIX) as s:
+            s.bind(str(sock))
+            watcher.check_docker_access({"": None}, sock)
 
     def test_docker_hosts_setting(self):
         hosts = watcher.docker_hosts
@@ -615,3 +623,68 @@ class SyncTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DockerClientTest(unittest.TestCase):
+    """The Docker client against a fake Engine API on a real unix socket."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "docker.sock")
+        self.requests = []
+        test = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                test.requests.append(self.path)
+                if self.path == "/containers/json":
+                    body = json.dumps([
+                        {"Id": "c1", "Names": ["/web/db", "/db"], "Labels": {"a": "1"}},
+                        {"Id": "c2", "Names": ["/app"], "Labels": None},
+                    ]).encode()
+                elif self.path.startswith("/events"):
+                    body = b'{"Action": "start"}\n\n{"Action": "die"}\n'
+                else:
+                    self.send_response(404)
+                    body = b'{"message": "page not found"}'
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+            def address_string(self):
+                return "unix"
+
+        server = socketserver.ThreadingUnixStreamServer(self.path, Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.docker = watcher.Docker(f"unix://{self.path}")
+
+    def test_containers(self):
+        self.assertEqual(self.docker.containers(), [
+            watcher.Container("c1", "db", {"a": "1"}),
+            watcher.Container("c2", "app", {}),
+        ])
+
+    def test_events(self):
+        self.assertEqual([e["Action"] for e in self.docker.events()], ["start", "die"])
+        self.assertIn('%22type%22%3A+%5B%22container%22%5D', self.requests[-1])
+
+    def test_http_error_names_the_message(self):
+        with self.assertRaisesRegex(watcher.DockerError, "HTTP 404: page not found"):
+            self.docker._open("/nope")
+
+    def test_unreachable_names_the_os_error(self):
+        missing = watcher.Docker(f"unix://{self.tmp.name}/none.sock")
+        with self.assertRaises(watcher.DockerError) as caught:
+            missing.containers()
+        self.assertEqual(watcher.describe(caught.exception), "unreachable: No such file or directory")

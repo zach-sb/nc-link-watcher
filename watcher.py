@@ -8,14 +8,18 @@ wherever it can, since each user's own menu order is tied to them.
 """
 
 import hashlib
+import http.client
 import json
 import logging
 import os
 import re
 import signal
+import socket
+import ssl
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -49,8 +53,8 @@ def is_true(value, default=False):
 
 def describe(exc):
     """A short reason for an exception, without the stack of wrapped errors around it.
-    Wrapped errors are followed too: docker-py wraps connection errors in its own."""
-    if isinstance(exc, NextcloudError):
+    Wrapped errors are followed too: requests wraps connection errors in its own."""
+    if isinstance(exc, (NextcloudError, DockerError)):
         return str(exc)
     cause = exc
     while cause is not None:
@@ -167,6 +171,104 @@ def docker_hosts(environ):
 def host_of(key):
     """The host name a link key belongs to ("" for the unnamed host)."""
     return key.split(":", 1)[0] if ":" in key else ""
+
+
+# --------------------------------------------------------------------------
+# Docker client: the two Engine API calls the watcher needs, over plain HTTP.
+# --------------------------------------------------------------------------
+
+class DockerError(Exception):
+    pass
+
+
+@dataclass
+class Container:
+    id: str
+    name: str
+    labels: dict
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path, timeout):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+class Docker:
+    TIMEOUT = 30
+
+    def __init__(self, url):
+        scheme, rest = url.split("://", 1)
+        self.scheme, self.address = scheme, rest.rstrip("/")
+
+    def _connection(self):
+        if self.scheme == "unix":
+            return UnixHTTPConnection(self.address, self.TIMEOUT)
+        if self.scheme == "https":
+            return http.client.HTTPSConnection(self.address, timeout=self.TIMEOUT,
+                                               context=ssl.create_default_context())
+        return http.client.HTTPConnection(self.address, timeout=self.TIMEOUT)   # tcp:// or http://
+
+    def _open(self, path, stream=False):
+        """GET path -> (connection, response); the caller closes the connection.
+        A stream has no read timeout once the headers are in."""
+        conn = self._connection()
+        try:
+            conn.connect()
+            sock = conn.sock   # http.client may let go of it once the response is read
+            conn.request("GET", path, headers={"User-Agent": USER_AGENT})
+            resp = conn.getresponse()
+            if stream:
+                sock.settimeout(None)
+        except OSError as exc:
+            conn.close()
+            raise DockerError(f"unreachable: {exc.strerror or exc}") from exc
+        if resp.status != 200:
+            body = resp.read()
+            conn.close()
+            try:
+                message = json.loads(body).get("message")
+            except (ValueError, AttributeError):
+                message = None
+            raise DockerError(f"HTTP {resp.status}: {message or resp.reason}")
+        return conn, resp
+
+    def containers(self):
+        """The running containers."""
+        conn, resp = self._open("/containers/json")
+        try:
+            data = json.loads(resp.read())
+        except OSError as exc:
+            raise DockerError(f"unreachable: {exc.strerror or exc}") from exc
+        except ValueError as exc:
+            raise DockerError("not a Docker API") from exc
+        finally:
+            conn.close()
+        result = []
+        for item in data:
+            # Names also lists legacy link aliases ("/other/alias"); the real name has no inner slash.
+            names = [n.lstrip("/") for n in item.get("Names") or []]
+            name = next((n for n in names if "/" not in n), names[0] if names else item["Id"][:12])
+            result.append(Container(item["Id"], name, item.get("Labels") or {}))
+        return result
+
+    def events(self):
+        """Container events, as dicts, until the connection drops."""
+        query = urllib.parse.urlencode({"filters": json.dumps({"type": ["container"]})})
+        conn, resp = self._open(f"/events?{query}", stream=True)   # quiet for hours is normal
+        try:
+            for line in resp:
+                if line.strip():
+                    yield json.loads(line)
+        except OSError as exc:
+            raise DockerError(f"unreachable: {exc.strerror or exc}") from exc
+        finally:
+            conn.close()
 
 
 # --------------------------------------------------------------------------
@@ -408,7 +510,7 @@ def read_containers(docker_client, cfg, host=""):
     p = LABELS
     extra_link = re.compile(rf"^{re.escape(p)}\.([A-Za-z0-9_-]+)\.(?:{'|'.join(FIELDS)})$")
     wanted, invalid, identity = {}, {}, {}
-    for container in docker_client.containers.list():   # running only, so a stopped service has no link
+    for container in docker_client.containers():   # running only, so a stopped service has no link
         labels = container.labels or {}
         enable = labels.get(f"{p}.enable", "").strip()
         if enable and is_true(enable, None) is None:
@@ -445,7 +547,7 @@ def watch_events(docker_factory, wake, subject="Docker"):
     lost = False
     while True:
         try:
-            events = docker_factory().events(decode=True, filters={"type": "container"})
+            events = docker_factory().events()
             if lost:
                 log.info("%s events: resolved", subject)
                 lost = False
@@ -791,11 +893,11 @@ class Watcher:
 # thing this program ever writes.
 # --------------------------------------------------------------------------
 
-def check_docker_access(hosts, socket):
+def check_docker_access(hosts, socket_path):
     """Boot check: with no Docker URL given, the socket must be mounted. Neither
     missing is a config error; whether Docker answers is checked every sync."""
-    if None in hosts.values() and not socket.exists():
-        sys.exit(f"Docker: DOCKER_HOST not set and {socket} not mounted")
+    if None in hosts.values() and not socket_path.is_socket():
+        sys.exit(f"Docker: DOCKER_HOST not set and {socket_path} not mounted")
 
 
 def health_server(watcher, port):
@@ -855,14 +957,8 @@ def run():
     check_writable(cfg.state_file)
 
     check_docker_access(cfg.docker_hosts, DOCKER_SOCKET)
-    import docker   # imported here so the sync logic can be tested without docker-py
-
-    def factory(url):
-        # Creating a client already asks Docker for its API version, so it happens
-        # inside the sync, where a host being down is reported, not fatal.
-        return docker.from_env if url is None else lambda: docker.DockerClient(base_url=url)
-
-    factories = {host: factory(url) for host, url in cfg.docker_hosts.items()}
+    factories = {host: (lambda url=url or f"unix://{DOCKER_SOCKET}": Docker(url))
+                 for host, url in cfg.docker_hosts.items()}
     watcher = Watcher(factories, Nextcloud(cfg), cfg)
     try:
         health = health_server(watcher, cfg.health_port)
