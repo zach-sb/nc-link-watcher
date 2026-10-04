@@ -78,8 +78,6 @@ def os_reason(exc):
             reason = cause.strerror
         cause = cause.__cause__ or cause.__context__
     return reason
-    log.debug("%r", exc)   # the full error; the log line is short
-    return f"{type(exc).__name__}: {exc}"
 
 
 def split_list(value):
@@ -496,7 +494,7 @@ def make_link(cfg, fields, default_name):
 
 def read_containers(docker_client, cfg, host=""):
     """One host's running containers -> ({link key: Link}, {link key: invalid label
-    problem}, {link key: identity}).
+    problem}, {link key: identity}, how many are running).
 
     Keys are container *names*, not ids, because an id changes every time a
     container is recreated and the link should survive that. A container's own
@@ -509,8 +507,10 @@ def read_containers(docker_client, cfg, host=""):
     # link's two (nextcloud-links.router.url), so an id can't be mistaken for a field.
     p = LABELS
     extra_link = re.compile(rf"^{re.escape(p)}\.([A-Za-z0-9_-]+)\.(?:{'|'.join(FIELDS)})$")
+    own_field = re.compile(rf"^{re.escape(p)}\.(?:enable|{'|'.join(FIELDS)})$")
     wanted, invalid, identity = {}, {}, {}
-    for container in docker_client.containers():   # running only, so a stopped service has no link
+    containers = docker_client.containers()   # running only, so a stopped service has no link
+    for container in containers:
         labels = container.labels or {}
         enable = labels.get(f"{p}.enable", "").strip()
         if enable and is_true(enable, None) is None:
@@ -521,6 +521,10 @@ def read_containers(docker_client, cfg, host=""):
             enable_problem = None
 
         base = f"{host}:{container.name}" if host else container.name
+        unread = sorted(label for label in labels if label.startswith(f"{p}.")
+                        and not own_field.match(label) and not extra_link.match(label))
+        if unread:   # most likely a typo, e.g. nextcloud-links.URL
+            log.debug("%s: unrecognised labels: %s", base, ", ".join(unread))
         candidates = {base: (read_fields(labels, p), container.name, "")}
         for link_id in {m.group(1) for m in map(extra_link.match, labels) if m}:
             candidates[f"{base}/{link_id}"] = (read_fields(labels, f"{p}.{link_id}"), link_id, link_id)
@@ -535,7 +539,7 @@ def read_containers(docker_client, cfg, host=""):
                 identity[key] = (host, container.id, link_id)
             except InvalidLabel as exc:
                 invalid[key] = str(exc)
-    return wanted, invalid, identity
+    return wanted, invalid, identity, len(containers)
 
 
 def watch_events(docker_factory, wake, subject="Docker"):
@@ -825,12 +829,14 @@ class Watcher:
             try:
                 if host not in self.clients:
                     self.clients[host] = factory()
-                host_wanted, host_invalid, host_identity = read_containers(self.clients[host], self.cfg, host)
+                host_wanted, host_invalid, host_identity, running = read_containers(self.clients[host], self.cfg, host)
             except Exception as exc:
                 self.clients.pop(host, None)   # reconnect from scratch next time
                 self.found[f"Docker {host}" if host else "Docker"] = describe(exc)
                 down.add(host)
                 continue
+            log.debug("%s: %d running; %s", f"Docker {host}" if host else "Docker", running,
+                      f"links: {', '.join(sorted(host_wanted))}" if host_wanted else "no links")
             wanted.update(host_wanted)
             invalid.update(host_invalid)
             identity.update(host_identity)

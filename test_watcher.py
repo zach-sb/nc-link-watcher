@@ -116,6 +116,22 @@ class SyncTests(unittest.TestCase):
         docker = on or self.docker
         docker.running = [c for c in docker.running if c.name != cname]
 
+    def test_debug_shows_what_docker_holds(self):
+        self.start("app", url="https://app.example.com", groups="family",
+                   raw={f"{P}.admin.url": "https://app.example.com/admin", f"{P}.admin.groups": "family"})
+        self.start("db")
+        self.start("typo", URL="https://typo.example.com")
+        with self.assertLogs("watcher", "DEBUG") as logs:
+            self.run_sync()
+        self.assertIn("DEBUG:watcher:typo: unrecognised labels: nextcloud-links.URL", logs.output)
+        self.assertIn("DEBUG:watcher:Docker: 3 running; links: app, app/admin", logs.output)
+        self.assertEqual(set(self.state()), {"app", "app/admin"})
+
+        self.docker.running = []
+        with self.assertLogs("watcher", "DEBUG") as logs:
+            self.run_sync()
+        self.assertIn("DEBUG:watcher:Docker: 0 running; no links", logs.output)
+
     def test_create_update_remove(self):
         self.start("jellyfin", url="https://jf.example.com", name="Jellyfin", icon="di-jellyfin", groups="family")
         self.run_sync()
