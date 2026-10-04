@@ -552,6 +552,15 @@ class SyncTests(unittest.TestCase):
         except DockerException as exc:
             self.assertEqual(watcher.describe(exc), "unreachable")
 
+    def test_connection_errors_name_the_os_error(self):
+        try:
+            try:
+                raise PermissionError(13, "Permission denied")
+            except Exception as inner:
+                raise watcher.requests.exceptions.ConnectionError(inner)
+        except Exception as exc:
+            self.assertEqual(watcher.describe(exc), "unreachable: Permission denied")
+
     def test_docker_client_failure_is_reported_not_fatal(self):
         def unreachable():
             raise RuntimeError("Error while fetching server API version")

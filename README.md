@@ -18,16 +18,14 @@ Keeps the links in Nextcloud's External Sites app in step with Docker container 
 1. In Nextcloud, enable the **External sites** app and create an app password for an admin account
    (Settings -> Security -> Devices & sessions).
 2. Fill in `NEXTCLOUD_URL`, `NEXTCLOUD_USER` and `NEXTCLOUD_APP_PASSWORD` in `docker-compose.yml`.
-3. `docker compose up -d --build`, then `docker logs -f nc-link-watcher`.
+3. `docker compose up -d`, then `docker logs -f nc-link-watcher`.
 
-The compose file builds the image locally as `nc-link-watcher:1.0.0`. To build it separately:
+The compose file uses `ghcr.io/zach-sb/nc-link-watcher:latest`. Released images are published for
+amd64 and arm64, tagged `1.0.0`, `1.0`, `1` and `latest`. To build it yourself:
 
 ```sh
 docker buildx build -t nc-link-watcher:1.0.0 --load .
 ```
-
-Released images are published to `ghcr.io/<owner>/nc-link-watcher` for amd64 and arm64, tagged
-`1.0.0`, `1.0`, `1` and `latest`.
 
 ## Labels
 
@@ -159,7 +157,7 @@ app: embed: not true or false
 app: unknown group: family
 app: create failed: HTTP 400: The given url is invalid (url)
 nas:app: renamed from nas:old-app
-Docker nas: unreachable
+Docker nas: unreachable: Connection refused
 Docker nas: resolved
 ```
 

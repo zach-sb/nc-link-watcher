@@ -59,8 +59,21 @@ def describe(exc):
         if isinstance(cause, requests.exceptions.Timeout):
             return "timed out"
         if isinstance(cause, requests.exceptions.ConnectionError):
-            return "unreachable"
+            reason = os_reason(cause)
+            return f"unreachable: {reason}" if reason else "unreachable"
         cause = cause.__cause__ or cause.__context__
+    log.debug("%r", exc)   # the full error; the log line is short
+    return f"{type(exc).__name__}: {exc}"
+
+
+def os_reason(exc):
+    """The innermost OS error's text, e.g. "Permission denied" for a socket the user can't open."""
+    reason, cause = None, exc
+    while cause is not None:
+        if isinstance(cause, OSError) and cause.strerror:
+            reason = cause.strerror
+        cause = cause.__cause__ or cause.__context__
+    return reason
     log.debug("%r", exc)   # the full error; the log line is short
     return f"{type(exc).__name__}: {exc}"
 
